@@ -14,13 +14,24 @@ MAX_TEMPERATURE = 1000.0
 EVENT_NO_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 
 
-def _validate_temperature(v: float) -> float:
+def _validate_finite_range(v: float, name: str) -> float:
     if not math.isfinite(v):
-        raise ValueError("temperature must be a finite number")
+        raise ValueError(f"{name} must be a finite number")
     if not (MIN_TEMPERATURE <= v <= MAX_TEMPERATURE):
         raise ValueError(
-            f"temperature must be within [{MIN_TEMPERATURE}, {MAX_TEMPERATURE}] °C"
+            f"{name} must be within [{MIN_TEMPERATURE}, {MAX_TEMPERATURE}] °C"
         )
+    return v
+
+
+def _validate_temperature(v: float) -> float:
+    return _validate_finite_range(v, "temperature")
+
+
+def _coerce_no(v):
+    # 允许客户端以 JSON 数字形式提交编号（事件号 / 策略号等）
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        v = format(v, "g")
     return v
 
 
@@ -34,10 +45,7 @@ class ReadingIn(BaseModel):
     @field_validator("event_no", mode="before")
     @classmethod
     def coerce_event_no(cls, v):
-        # 允许客户端以 JSON 数字形式提交事件号
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            v = format(v, "g")
-        return v
+        return _coerce_no(v)
 
     @field_validator("temperature")
     @classmethod
@@ -281,3 +289,55 @@ class DisputeResponse(BaseModel):
 class DisputeListResponse(BaseModel):
     device_id: str
     disputes: List[DisputeOut]
+
+
+class LimitPolicyIn(BaseModel):
+    """温度上限策略请求体：策略号 + 生效时间 + 阈值。
+
+    策略自 effective_from（采样时间口径）起生效，覆盖其后读数的上限判定；
+    生效时间可回溯到历史读数之前 / 之间，写入后按每条读数所处策略重算区间。
+    """
+
+    policy_no: str = Field(
+        description="设备内唯一策略号（字母 / 数字 / `.` `_` `-`，≤ 64 字符）",
+        pattern=EVENT_NO_PATTERN,
+    )
+    effective_from: datetime = Field(description="策略生效时间（采样时间口径）")
+    temp_limit: float = Field(description="自生效时间起适用的温度上限（°C）")
+
+    @field_validator("policy_no", mode="before")
+    @classmethod
+    def coerce_policy_no(cls, v):
+        return _coerce_no(v)
+
+    @field_validator("temp_limit")
+    @classmethod
+    def limit_plausible(cls, v: float) -> float:
+        return _validate_finite_range(v, "temp_limit")
+
+
+class LimitPolicyOut(BaseModel):
+    policy_no: str
+    effective_from: str = Field(description="规范化（UTC）后的生效时间")
+    temp_limit: float
+    created_at: str
+
+
+class LimitPolicyResponse(BaseModel):
+    """策略写入响应：策略内容 + 重算后的当前全量区间与相对变更。"""
+
+    device_id: str
+    limit: float = Field(description="全局默认上限（未被策略覆盖的时间沿用该值）")
+    policy: LimitPolicyOut
+    intervals: List[Interval] = Field(description="策略写入后该设备的全部有效超温区间")
+    changes: IntervalChanges = Field(
+        description="本次策略写入引起的区间差异（按每条读数所处策略重算）"
+    )
+
+
+class LimitPolicyListResponse(BaseModel):
+    device_id: str
+    limit: float = Field(description="全局默认上限（未被策略覆盖的时间沿用该值）")
+    policies: List[LimitPolicyOut] = Field(
+        description="该设备全部温度上限策略，按生效时间、策略号排序"
+    )

@@ -12,10 +12,17 @@
 申请时冻结读数内容与**修订号**；待审争议可批准或驳回，批准时在同一事务内核对修订号，
 读数若已被直接操作或其他争议改变，争议转为**过期**且不再改读数。
 
+还支持**按采样时间生效的温度上限策略**：客户端按设备提交策略号、阈值与生效时间，
+每条读数适用其采样时间所处策略的上限（生效时间不晚于该读数的最近一条策略），
+未覆盖时间沿用全局上限；策略写入后在同一事务内按每条读数所处策略重算超温区间
+（含历史读数，回溯生效时间立即生效），同策略号同内容重放幂等、异内容冲突，
+同设备同一生效时间只允许一条策略。
+
 ## 超温区间判定规则
 
 - 同一设备的**有效**（未撤销）读数按 **(采样时间, 事件号)** 升序排列；
-- 温度 **严格大于** 上限（`TEMP_LIMIT`）的读数视为“超限”（等于上限不算超限）；
+- 温度 **严格大于** 上限的读数视为“超限”（等于上限不算超限）；
+  上限按读数采样时间所处的**温度上限策略**确定，无策略覆盖时用全局 `TEMP_LIMIT`；
 - **连续 ≥ 2 条**超限读数构成一个超温区间；
   - **起点**：首个超限读数；**终点**：区间之后首个不超限读数；
   - 若超限一直延续到最后一条读数，区间未结束，终点字段为 `null`；
@@ -52,7 +59,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 环境变量     | 默认值                            | 说明                                   |
 | ------------ | --------------------------------- | -------------------------------------- |
-| `TEMP_LIMIT` | `8.0`                             | 超温上限（°C），严格大于该值视为超限   |
+| `TEMP_LIMIT` | `8.0`                             | 全局默认超温上限（°C）：未被任何温度上限策略覆盖的读数按它判定，严格大于视为超限 |
 | `DB_PATH`    | 本地 `./coldchain.db`，容器 `/data/coldchain.db` | SQLite 数据库文件路径 |
 
 Compose 中通过 `environment` 修改，例如 `TEMP_LIMIT: "2.0"`。
@@ -80,6 +87,8 @@ Compose 中通过 `environment` 修改，例如 `TEMP_LIMIT: "2.0"`。
 | POST   | `/devices/{device_id}/disputes/{dispute_no}/decisions` | 批准 / 驳回待审争议     |
 | GET    | `/devices/{device_id}/disputes`         | 查询设备全部争议                           |
 | GET    | `/devices/{device_id}/disputes/{dispute_no}` | 查询单个争议（未知争议号 404）        |
+| POST   | `/devices/{device_id}/limit-policies`   | 提交温度上限策略（同号同内容幂等，异内容 409） |
+| GET    | `/devices/{device_id}/limit-policies`   | 查询设备全部温度上限策略（按生效时间排序）   |
 | GET    | `/health`                               | 健康检查                                   |
 
 ### 请求字段
@@ -409,18 +418,120 @@ curl $BASE/disputes/D1              # 单个争议（含冻结依据、终态、
   不在原读数 / 区间响应中暴露）；
 - 新增批次表 `reading_batches` 与原表、争议表相互独立，批次提交只复用既有读数写入
   与区间规则，不改变单条读数 / 争议接口的行为；
+- 新增策略表 `limit_policies` 与既有各表相互独立；未配置任何策略时，所有接口的
+  区间判定与之前完全一致（统一使用全局 `TEMP_LIMIT`）；
 - 升级旧版本数据库时自动幂等迁移：旧读数补列 `revision = 1`，新表自动创建，
   无需手工脚本，现有 `uvicorn app.main:app` 启动方式保持可用。
+
+## 按采样时间生效的温度上限策略
+
+### 规则
+
+- 策略按设备隔离，客户端提交 **策略号 + 阈值 + 生效时间**；
+- 每条读数适用**生效时间不晚于其采样时间的最近一条策略**的上限
+  （`effective_from <= sampled_at`，生效时间等于采样时间即生效）；
+- 策略生效时间**之前**未被任何策略覆盖的读数，沿用全局 `TEMP_LIMIT`；
+- 同一设备**同一生效时间只允许一条策略**（UTC 归一化后判定，等价时区算同一时间）；
+- 策略写入后在**同一事务**内按每条读数所处策略重算该设备全部超温区间，
+  响应返回当前全量区间与相对变更（`added` / `changed` / `invalidated`）；
+  生效时间可回溯到历史读数之前 / 之间，历史读数立即按新策略重判；
+- 策略生效后，读数提交 / 更正 / 撤销、批次上报、争议批准执行的区间判定
+  一律使用各读数所处策略的上限。
+
+### 提交策略 `POST /devices/{device_id}/limit-policies`
+
+```json
+{
+  "policy_no": "P1",
+  "effective_from": "2026-10-01T00:00:00Z",
+  "temp_limit": 5.0
+}
+```
+
+- `policy_no`：设备内唯一策略号（规则同事件号，≤ 64 字符）；
+- `effective_from`：ISO 8601 生效时间（采样时间口径，无时区按 UTC 处理）；
+- `temp_limit`：温度上限（°C），校验规则同读数温度（有限数值，`[-273.15, 1000]`）。
+
+### 响应（首次成功 `201 Created`）
+
+```json
+{
+  "device_id": "truck-001",
+  "limit": 8.0,
+  "policy": {
+    "policy_no": "P1",
+    "effective_from": "2026-10-01T00:00:00.000000Z",
+    "temp_limit": 5.0,
+    "created_at": "2026-10-06T02:34:30.061523Z"
+  },
+  "intervals": [ /* 策略写入后的全量超温区间（结构同前） */ ],
+  "changes":   { "added": [], "changed": [], "invalidated": [] }
+}
+```
+
+- `limit` 为全局默认上限（未被策略覆盖的时间沿用该值），`policy` 为本次写入的策略；
+- **同策略号 + 同内容**重放（时间支持等价时区表示）：`200` 且原样返回**首次回执**
+  （含首次的区间与差异），不重复写入、不重算——即使读数或其他策略随后发生变化；
+- **同策略号 + 异内容**（生效时间或阈值任一不同）：`409`；
+- **同设备同一生效时间**已被其他策略占用：`409`（`detail` 指明占用该时间的策略号）；
+- **未知设备**（从未上报过读数）：`404`；**非法阈值 / 策略号 / 生效时间**：`422`；
+- 冲突 / 校验失败的提交不留痕，修正后同一策略号可重新首次提交。
+
+### 查询策略 `GET /devices/{device_id}/limit-policies`
+
+返回 `{"device_id", "limit", "policies": [...]}`，策略按生效时间、策略号排序。
+
+### 策略接口示例
+
+```bash
+BASE=http://localhost:8000/devices/truck-001
+
+# 1. 未知设备提交策略 → 404
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P1","effective_from":"2026-10-01T00:00:00Z","temp_limit":5.0}'
+
+# 2. 先上报两条历史读数（全局上限 8.0 下 7.0 / 7.5 均不超限，无区间）
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E1","sampled_at":"2026-10-01T08:00:00Z","temperature":7.0}'
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E2","sampled_at":"2026-10-01T08:10:00Z","temperature":7.5}'
+
+# 3. 回溯生效的策略：上限 5.0 自 00:00 起 → 历史读数重判，
+#    E1、E2 连续超限，201 响应中 changes.added 出现起点 E1 的区间
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P1","effective_from":"2026-10-01T00:00:00Z","temp_limit":5.0}'
+
+# 4. 同号同内容重放（等价时区）→ 200，返回与首次完全一致的回执
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P1","effective_from":"2026-10-01T08:00:00+08:00","temp_limit":5.0}'
+
+# 5. 同号异内容 → 409；同生效时间换策略号 → 409
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P1","effective_from":"2026-10-01T00:00:00Z","temp_limit":6.0}'
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P2","effective_from":"2026-10-01T00:00:00Z","temp_limit":6.0}'
+
+# 6. 第二段策略：09:00 起上限抬到 10.0
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P2","effective_from":"2026-10-01T09:00:00Z","temp_limit":10.0}'
+
+# 7. 新读数按所处策略判定：09:10 适用 P2（上限 10.0），9.0 不超限 → E1 区间闭合
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E3","sampled_at":"2026-10-01T09:10:00Z","temperature":9.0}'
+
+# 8. 查询设备全部策略（按生效时间排序）
+curl $BASE/limit-policies
+```
 
 ## 错误码
 
 | 状态码 | 场景                                                                 |
 | ------ | -------------------------------------------------------------------- |
-| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试） |
-| 201    | 争议首次申请成功；批次首次提交成功                                   |
-| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号 |
-| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝） |
-| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号 |
+| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试、策略同号同内容重放） |
+| 201    | 争议首次申请成功；批次首次提交成功；策略首次写入成功                 |
+| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号；向未知设备（无任何读数）提交策略 |
+| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝）；同策略号异内容；同设备同一生效时间的策略重复 |
+| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号；非法策略号 / 生效时间 / 策略阈值 |
 
 错误响应体均含 `detail` 字段说明原因。
 
@@ -435,15 +546,16 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、错误处理
-  intervals.py  # 区间计算与差异比对（纯函数）
-  models.py     # 请求/响应模型与输入校验（含批次、争议申请 / 决定模型）
-  db.py         # SQLite 连接、建表（读数 / 争议 / 批次）与旧库 revision 增量迁移
+  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、温度上限策略、错误处理
+  intervals.py  # 区间计算（单上限 / 按策略逐读数上限）与差异比对（纯函数）
+  models.py     # 请求/响应模型与输入校验（含批次、争议申请 / 决定、策略模型）
+  db.py         # SQLite 连接、建表（读数 / 争议 / 批次 / 策略）与旧库 revision 增量迁移
   config.py     # 环境变量配置
   util.py       # 时间规范化（UTC、固定宽度，保证可排序）
 tests/
   test_api.py       # 原读数 / 区间接口测试（语义不变）
   test_batches.py   # 离线网关成批上报测试（整批事务、逐条状态、一次性差异、重试回执）
   test_disputes.py  # 争议工作流测试（冻结、批准 / 驳回、过期、幂等、迁移）
+  test_policies.py  # 温度上限策略测试（回溯重算、多策略时序、幂等、冲突、错误、隔离）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

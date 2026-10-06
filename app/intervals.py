@@ -7,12 +7,17 @@
 - 区间起点为首个超限读数，终点为区间后首个不超限读数；
 - 若超限一直延续到最后一条读数，则区间未结束，终点为空；
 - 区间以起点读数的事件号为唯一标识。
+
+按采样时间生效的温度上限策略：每条读数适用其采样时间所处策略的上限
+（生效时间不晚于该读数采样时间的最近一条策略），无策略覆盖的读数
+沿用全局默认上限。
 """
-from typing import Dict, List
+from bisect import bisect_right
+from typing import Callable, Dict, List, Sequence, Tuple
 
 
-def compute_intervals(readings: List[dict], limit: float) -> List[dict]:
-    """由有序有效读数计算当前全部超温区间。"""
+def _compute(readings: List[dict], exceeds: Callable[[dict], bool]) -> List[dict]:
+    """按给定的超限判定函数计算当前全部超温区间（公共实现）。"""
     intervals: List[dict] = []
     run: List[dict] = []
 
@@ -29,7 +34,7 @@ def compute_intervals(readings: List[dict], limit: float) -> List[dict]:
         }
 
     for r in readings:
-        if r["temperature"] > limit:
+        if exceeds(r):
             run.append(r)
         else:
             if len(run) >= 2:
@@ -38,6 +43,36 @@ def compute_intervals(readings: List[dict], limit: float) -> List[dict]:
     if len(run) >= 2:
         intervals.append(close(run, None))
     return intervals
+
+
+def compute_intervals(readings: List[dict], limit: float) -> List[dict]:
+    """单一上限：全部读数共用同一超限阈值。"""
+    return _compute(readings, lambda r: r["temperature"] > limit)
+
+
+def compute_intervals_with_policies(
+    readings: List[dict],
+    policies: Sequence[Tuple[str, float]],
+    default_limit: float,
+) -> List[dict]:
+    """按采样时间生效的策略上限计算超温区间。
+
+    policies 为 (生效时间, 上限) 列表，按生效时间升序；生效时间与读数
+    采样时间同为 UTC 固定宽度 ISO 字符串，可直接按字典序比较。
+    每条读数适用生效时间不晚于其采样时间的最近一条策略的上限；
+    此前无策略时沿用 default_limit（全局上限）。
+    """
+    if not policies:
+        return compute_intervals(readings, default_limit)
+    effective_times = [p[0] for p in policies]
+    limits = [p[1] for p in policies]
+
+    def exceeds(r: dict) -> bool:
+        idx = bisect_right(effective_times, r["sampled_at"]) - 1
+        limit = limits[idx] if idx >= 0 else default_limit
+        return r["temperature"] > limit
+
+    return _compute(readings, exceeds)
 
 
 def diff_intervals(before: List[dict], after: List[dict]) -> Dict[str, List[dict]]:
