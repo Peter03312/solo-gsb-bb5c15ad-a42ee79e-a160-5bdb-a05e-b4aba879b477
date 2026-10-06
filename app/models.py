@@ -199,6 +199,62 @@ class ReadingsResponse(BaseModel):
     readings: List[ReadingOut]
 
 
+class LimitPolicyIn(BaseModel):
+    """温度上限策略写入请求体：设备内唯一策略号 + 阈值 + 生效采样时间。
+
+    策略自 effective_from（含该时刻）起覆盖全局上限，直到下一条策略生效；
+    生效时间早于全部策略的读数仍沿用全局上限。
+    """
+
+    policy_no: str = Field(
+        description="设备内唯一策略号（规则同事件号，字母 / 数字开头，≤ 64 字符）",
+        pattern=EVENT_NO_PATTERN,
+    )
+    temp_limit: float = Field(description="策略阈值（°C），校验规则同温度")
+    effective_from: datetime = Field(description="生效采样时间（ISO 8601，无时区按 UTC）")
+
+    @field_validator("temp_limit")
+    @classmethod
+    def temp_limit_plausible(cls, v: float) -> float:
+        # 阈值沿用温度的物理范围校验，非法阈值（非数值 / 无穷 / 超范围）→ 422
+        return _validate_temperature(v)
+
+
+class LimitPolicyOut(BaseModel):
+    """策略对象（查询用）。"""
+
+    policy_no: str
+    temp_limit: float
+    effective_from: str = Field(description="规范化（UTC）后的生效采样时间")
+    created_at: str
+
+
+class LimitPolicyResponse(BaseModel):
+    """策略写入回执：策略内容 + 写入后全量区间 + 本次差异。
+
+    同策略号同内容重放时原样返回首次回执（即使此后读数 / 策略又有变化）。
+    """
+
+    device_id: str
+    policy_no: str
+    temp_limit: float
+    effective_from: str
+    limit: float = Field(description="全局默认上限（未被任何策略覆盖的时段沿用）")
+    intervals: List[Interval] = Field(description="策略生效后该设备的全部有效超温区间")
+    changes: IntervalChanges = Field(
+        description="本次策略写入引起的区间差异（历史读数按回溯生效时间重算）"
+    )
+    created_at: str = Field(description="首次写入时间；同号同内容重放原样返回")
+
+
+class LimitPolicyListResponse(BaseModel):
+    device_id: str
+    limit: float = Field(description="全局默认上限")
+    policies: List[LimitPolicyOut] = Field(
+        description="该设备全部策略，按生效时间、策略号升序"
+    )
+
+
 class BatchReadingResult(BaseModel):
     """批内逐条读数的处理结果。"""
 

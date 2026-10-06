@@ -6,6 +6,9 @@ from contextlib import contextmanager
 # 都会 +1。争议申请时冻结该修订号，批准时在同一事务内核对，不一致即判定为过期。
 # reading_batches 持久化离线网关每个批次号的规范化有序内容与首次回执：同批次重试
 # 按内容判同后原样返回首次回执，批次写入与回执存档在同一事务完成。
+# limit_policies 持久化按采样时间生效的温度上限策略：同设备策略号唯一、生效时间唯一；
+# 读数适用最后一个 effective_from <= 采样时间的策略阈值，之前回退全局上限；
+# receipt 存档首次写入回执（含当时全量区间与差异），同号同内容重放原样返回。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
     device_id   TEXT NOT NULL,
@@ -47,6 +50,17 @@ CREATE TABLE IF NOT EXISTS reading_batches (
     receipt     TEXT NOT NULL,    -- 首次回执（JSON 存档：逐条状态、全量区间、整批一次性差异）
     created_at  TEXT NOT NULL,
     PRIMARY KEY (device_id, batch_no)
+);
+
+CREATE TABLE IF NOT EXISTS limit_policies (
+    device_id      TEXT NOT NULL,
+    policy_no      TEXT NOT NULL,    -- 设备内唯一策略号
+    temp_limit     REAL NOT NULL,    -- 策略阈值（°C），自生效时间起覆盖全局上限
+    effective_from TEXT NOT NULL,    -- 生效采样时间（UTC 归一化，含该时刻本身）
+    receipt        TEXT NOT NULL,    -- 首次写入回执（JSON 存档：当时全量区间与差异）
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (device_id, policy_no),
+    UNIQUE (device_id, effective_from)  -- 同设备生效时间相同的策略不得重复
 );
 """
 

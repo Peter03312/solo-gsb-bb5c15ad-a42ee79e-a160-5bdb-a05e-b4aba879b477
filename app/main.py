@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .db import connect, init_db
-from .intervals import compute_intervals, diff_intervals
+from .intervals import compute_intervals, diff_intervals, policy_limit_resolver
 from .models import (
     BatchIn,
     BatchReceiptResponse,
@@ -20,6 +20,9 @@ from .models import (
     DisputeListResponse,
     DisputeResponse,
     IntervalsResponse,
+    LimitPolicyIn,
+    LimitPolicyListResponse,
+    LimitPolicyResponse,
     ReadingIn,
     ReadingsResponse,
 )
@@ -39,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷链运输温度事件核验服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "按设备提交 / 更正 / 撤销温度读数，自动核验并维护超温区间。"
         "连续两次有效读数超过上限即形成超温区间，区间以起点事件号标识。"
@@ -48,6 +51,9 @@ app = FastAPI(
         "同批次号同内容重试返回首次回执。"
         "还支持按争议号对读数提出更正 / 撤销争议：申请时冻结读数与修订号，"
         "批准时在同一事务内核对修订号，读数已被改变则争议转为过期。"
+        "支持按采样时间生效的温度上限策略：策略号唯一、生效时间唯一，"
+        "读数按其采样时间所处策略判定超限，未覆盖时段沿用全局上限，"
+        "策略写入后同一事务内重算全量区间（含历史读数回溯）并返回差异。"
     ),
     lifespan=lifespan,
 )
@@ -85,8 +91,23 @@ def _load_valid_readings(conn, device_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _load_policies(conn, device_id: str) -> list[tuple[str, float]]:
+    """读取设备全部上限策略，按生效时间升序，供逐读数解析适用上限。"""
+    rows = conn.execute(
+        "SELECT effective_from, temp_limit FROM limit_policies "
+        "WHERE device_id = ? ORDER BY effective_from",
+        (device_id,),
+    ).fetchall()
+    return [(r["effective_from"], r["temp_limit"]) for r in rows]
+
+
 def _current_intervals(conn, device_id: str, limit: float) -> list[dict]:
-    return compute_intervals(_load_valid_readings(conn, device_id), limit)
+    """按每条读数采样时间所处的策略（无策略覆盖则沿用全局上限）计算区间。"""
+    readings = _load_valid_readings(conn, device_id)
+    policies = _load_policies(conn, device_id)
+    if not policies:
+        return compute_intervals(readings, limit)
+    return compute_intervals(readings, policy_limit_resolver(policies, limit))
 
 
 def _mutate(settings: Settings, device_id: str, op: Callable) -> dict:
@@ -383,6 +404,148 @@ def submit_batch(
             conn.rollback()
             raise
     return receipt
+
+
+# ---------------------------------------------------------------- 温度上限策略
+
+def _get_policy(conn, device_id: str, policy_no: str):
+    return conn.execute(
+        "SELECT * FROM limit_policies WHERE device_id = ? AND policy_no = ?",
+        (device_id, policy_no),
+    ).fetchone()
+
+
+@app.post(
+    "/devices/{device_id}/limit-policies",
+    response_model=LimitPolicyResponse,
+    status_code=201,
+    summary="写入按采样时间生效的温度上限策略（同号同内容幂等，异内容冲突）",
+)
+def create_limit_policy(
+    device_id: str,
+    body: LimitPolicyIn,
+    settings: Settings = Depends(get_settings),
+):
+    effective_from = to_utc_iso(body.effective_from)
+
+    with connect(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = _get_policy(conn, device_id, body.policy_no)
+            if existing is not None:
+                same = (
+                    existing["temp_limit"] == body.temp_limit
+                    and existing["effective_from"] == effective_from
+                )
+                if same:
+                    # 同号同内容重放：不重复写入、不重算，原样返回首次回执
+                    receipt = json.loads(existing["receipt"])
+                    conn.commit()
+                    return JSONResponse(status_code=200, content=receipt)
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"policy_no '{body.policy_no}' already exists on device "
+                        f"'{device_id}' with different content"
+                    ),
+                )
+
+            # 未知设备（尚无任何读数，含已撤销）不允许下发策略
+            known = conn.execute(
+                "SELECT 1 FROM readings WHERE device_id = ? LIMIT 1",
+                (device_id,),
+            ).fetchone()
+            if known is None:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"unknown device '{device_id}': no readings have been "
+                        f"submitted for this device"
+                    ),
+                )
+
+            # 生效时间相同的策略不得重复（与策略号无关）
+            clash = conn.execute(
+                "SELECT policy_no FROM limit_policies "
+                "WHERE device_id = ? AND effective_from = ?",
+                (device_id, effective_from),
+            ).fetchone()
+            if clash is not None:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"effective_from '{effective_from}' is already used by "
+                        f"policy '{clash['policy_no']}' on device '{device_id}'; "
+                        f"policies with the same effective time are not allowed"
+                    ),
+                )
+
+            # 同一事务内：先写策略，再按库内最新策略集重算全量区间
+            # （生效时间可早于现有读数，历史读数同样按回溯策略重新判定）
+            before = _current_intervals(conn, device_id, settings.temp_limit)
+            now = utc_now_iso()
+            conn.execute(
+                "INSERT INTO limit_policies "
+                "(device_id, policy_no, temp_limit, effective_from, receipt, "
+                "created_at) "
+                "VALUES (?, ?, ?, ?, '', ?)",
+                (device_id, body.policy_no, body.temp_limit, effective_from, now),
+            )
+            after = _current_intervals(conn, device_id, settings.temp_limit)
+            receipt = {
+                "device_id": device_id,
+                "policy_no": body.policy_no,
+                "temp_limit": body.temp_limit,
+                "effective_from": effective_from,
+                "limit": settings.temp_limit,
+                "intervals": after,
+                "changes": diff_intervals(before, after),
+                "created_at": now,
+            }
+            # 回执（含当时全量区间与差异）与策略在同一事务提交
+            conn.execute(
+                "UPDATE limit_policies SET receipt = ? "
+                "WHERE device_id = ? AND policy_no = ?",
+                (json.dumps(receipt, ensure_ascii=False), device_id, body.policy_no),
+            )
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    return receipt
+
+
+@app.get(
+    "/devices/{device_id}/limit-policies",
+    response_model=LimitPolicyListResponse,
+    summary="查询设备全部温度上限策略（按生效时间升序）",
+)
+def list_limit_policies(device_id: str, settings: Settings = Depends(get_settings)):
+    with connect(settings.db_path) as conn:
+        rows = conn.execute(
+            "SELECT policy_no, temp_limit, effective_from, created_at "
+            "FROM limit_policies WHERE device_id = ? "
+            "ORDER BY effective_from, policy_no",
+            (device_id,),
+        ).fetchall()
+    return {
+        "device_id": device_id,
+        "limit": settings.temp_limit,
+        "policies": [
+            {
+                "policy_no": r["policy_no"],
+                "temp_limit": r["temp_limit"],
+                "effective_from": r["effective_from"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ],
+    }
 
 
 # ---------------------------------------------------------------- 争议工作流
@@ -773,7 +936,7 @@ def health():
 def root(settings: Settings = Depends(get_settings)):
     return {
         "service": "coldchain-temperature-verification",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "temp_limit": settings.temp_limit,
         "docs": "/docs",
     }
